@@ -33,7 +33,7 @@ jobs:
           python-version: 3.14
 
       - name: Setup Zephyr project
-        uses: zephyrproject-rtos/action-zephyr-setup@be8136a8bba01580485d98b7ad2d32477c36a49a # v1.0.15
+        uses: zephyrproject-rtos/action-zephyr-setup@cc223fe61661d8573c1cd3f95f72f90cce729ae9 # v1.0.16
         with:
           app-path: cannectivity
           toolchains: arm-zephyr-eabi
@@ -44,8 +44,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            # Limit Windows to one platform
-            EXTRA_TWISTER_FLAGS="--short-build-path -O/tmp/twister-out -p canbardo"
+            EXTRA_TWISTER_FLAGS="--short-build-path -O/tmp/twister-out"
           fi
           west twister -T app -v --inline-logs --integration $EXTRA_TWISTER_FLAGS
 
@@ -67,6 +66,6 @@ jobs:
           west twister -T tests -v --inline-logs --integration $EXTRA_TWISTER_FLAGS
 
       - name: Print ccache stats
-        if: runner.os != 'Windows'
+        shell: bash
         run: |
           ccache -s -vv
