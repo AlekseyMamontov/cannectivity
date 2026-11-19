@@ -61,6 +61,10 @@ struct gs_usb_channel_data {
 	uint16_t ch;
 	bool started;
 	bool busoff;
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
+	/* CAN controller TX queue did not drain in time, do not block the shared TX thread */
+	bool tx_stalled;
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 };
 
 struct gs_usb_data {
@@ -1299,6 +1303,60 @@ static void gs_usb_rx_thread(void *p1, void *p2, void *p3)
 		}
 	}
 }
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
+
+/* CAN_ERR_TX_TIMEOUT (linux/can/error.h): TX timeout (by netdevice driver) */
+#ifndef GS_USB_CAN_ERR_TX_TIMEOUT
+#define GS_USB_CAN_ERR_TX_TIMEOUT BIT(0)
+#endif
+
+/*
+ * Report a dropped TX frame to the host as a CAN error frame (CAN_ERR_TX_TIMEOUT). The echo
+ * frame alone cannot carry this information, as the Linux gs_usb driver counts every echo frame
+ * as a successfully transmitted frame.
+ */
+static void gs_usb_report_tx_drop(struct gs_usb_channel_data *channel)
+{
+	struct gs_usb_data *data = CONTAINER_OF(channel, struct gs_usb_data, channels[channel->ch]);
+	const struct gs_usb_config *config = data->dev->config;
+	struct gs_usb_host_frame_hdr hdr = {0};
+	uint8_t payload[8] = {0};
+	struct net_buf *buf;
+	uint8_t ep;
+
+	ep = gs_usb_get_bulk_in_ep_addr(config->c_data);
+	buf = gs_usb_buf_alloc(config, ep);
+	if (buf == NULL) {
+		LOG_ERR("failed to allocate TX drop error frame for channel %u", channel->ch);
+		k_sem_give(&channel->rx_overflows);
+		return;
+	}
+
+	hdr.echo_id = GS_USB_HOST_FRAME_ECHO_ID_RX_FRAME;
+	hdr.can_id = sys_cpu_to_le32(GS_USB_CAN_ID_FLAG_ERR | GS_USB_CAN_ERR_TX_TIMEOUT);
+	hdr.can_dlc = can_bytes_to_dlc(sizeof(payload));
+	hdr.channel = channel->ch;
+
+	net_buf_add_mem(buf, &hdr, sizeof(hdr));
+	net_buf_add_mem(buf, payload, sizeof(payload));
+
+#ifdef CONFIG_USBD_GS_USB_TIMESTAMP
+	if ((channel->mode & GS_USB_CAN_MODE_HW_TIMESTAMP) != 0U) {
+		uint32_t timestamp = 0U;
+		int err;
+
+		err = data->ops.timestamp(data->dev, &timestamp, data->user_data);
+		if (err != 0) {
+			LOG_ERR("failed to get TX drop timestamp (err %d)", err);
+		}
+
+		net_buf_add_le32(buf, timestamp);
+	}
+#endif /* CONFIG_USBD_GS_USB_TIMESTAMP */
+
+	k_fifo_put(&data->rx_fifo, buf);
+}
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 
 static void gs_usb_can_tx_callback(const struct device *can_dev, int error, void *user_data)
 {
@@ -1311,8 +1369,28 @@ static void gs_usb_can_tx_callback(const struct device *can_dev, int error, void
 	uint8_t *tail;
 
 	if (error != 0) {
-		/* There is currently no way to report a dropped frame to the host driver */
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
 		LOG_ERR("failed to send CAN frame (err %d)", error);
+
+		/* Report the dropped frame to the host as a CAN error frame */
+		gs_usb_report_tx_drop(channel);
+
+#ifdef CONFIG_USBD_GS_USB_TX_DROP_ECHO
+		/* The echo frame is sent below, which releases the host TX context (echo_id) */
+#else /* !CONFIG_USBD_GS_USB_TX_DROP_ECHO */
+		/*
+		 * No echo frame is sent for the dropped frame, so the host does not see it as
+		 * transmitted. The host TX context (echo_id) of the frame stays in use.
+		 */
+		net_buf_unref(buf);
+		return;
+#endif /* CONFIG_USBD_GS_USB_TX_DROP_ECHO */
+#else /* !CONFIG_USBD_GS_USB_TX_NONBLOCKING */
+		/* There is no way to report a dropped frame to the host driver */
+		LOG_ERR("failed to send CAN frame (err %d)", error);
+		net_buf_unref(buf);
+		return;
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 	}
 
 #ifdef CONFIG_USBD_GS_USB_TIMESTAMP
@@ -1357,6 +1435,9 @@ static void gs_usb_tx_thread(void *p1, void *p2, void *p3)
 	struct can_frame frame;
 	struct net_buf *buf;
 	uintptr_t pchannel;
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
+	k_timeout_t timeout;
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 	uint32_t can_id;
 	uint8_t ep;
 	int err;
@@ -1432,12 +1513,37 @@ static void gs_usb_tx_thread(void *p1, void *p2, void *p3)
 		pchannel = POINTER_TO_UINT(channel);
 		net_buf_add_mem(buf, &pchannel, sizeof(pchannel));
 
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
+		/*
+		 * The TX thread is shared between all channels. Never wait indefinitely for a single
+		 * channel (e.g. no ACK on the bus keeps all TX mailboxes occupied), as that would
+		 * block TX for all other channels. Once a channel has timed out, do not wait for it
+		 * again until it accepts a frame.
+		 */
+		timeout = channel->tx_stalled ? K_NO_WAIT : K_MSEC(CONFIG_USBD_GS_USB_TX_TIMEOUT_MS);
+
+		err = can_send(channel->dev, &frame, timeout, gs_usb_can_tx_callback, buf);
+		if (err == 0) {
+			channel->tx_stalled = false;
+		} else {
+			if (err == -EAGAIN) {
+				channel->tx_stalled = true;
+			}
+
+			/*
+			 * can_send() does not invoke the TX callback on error. Invoke it here, which
+			 * reports the dropped frame to the host.
+			 */
+			gs_usb_can_tx_callback(channel->dev, err, buf);
+		}
+#else /* !CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 		err = can_send(channel->dev, &frame, K_FOREVER, gs_usb_can_tx_callback, buf);
 		if (err != 0) {
 			/* There is no way to report a dropped frame to the host driver */
 			LOG_ERR("failed to enqueue CAN frame for TX (err %d)", err);
 			net_buf_unref(buf);
 		}
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 	}
 }
 
@@ -1623,6 +1729,9 @@ static int gs_usb_reset_channel(const struct device *dev, uint16_t ch)
 	channel->mode = GS_USB_CAN_MODE_NORMAL;
 	channel->started = false;
 	channel->busoff = false;
+#ifdef CONFIG_USBD_GS_USB_TX_NONBLOCKING
+	channel->tx_stalled = false;
+#endif /* CONFIG_USBD_GS_USB_TX_NONBLOCKING */
 	k_sem_reset(&channel->rx_overflows);
 
 	err = can_stop(channel->dev);

@@ -30,11 +30,43 @@ config USBD_GS_USB_POOL_SIZE
 	int "Host frame buffer pool size"
 	default 20 if !USBD_GS_USB_COMPATIBILITY_MODE
 	default 21 if USBD_GS_USB_COMPATIBILITY_MODE
-	range 2 $(UINT32_MAX)
 	help
 	  Size of the pool used for allocating Geschwister Schneider USB/CAN (gs_usb) host
 	  frames. The pool is used for both RX and TX, and shared between all channels of a given
 	  gs_usb instance.
+
+config USBD_GS_USB_TX_NONBLOCKING
+	bool "Do not block TX on a stalled channel, report dropped frames as error frames"
+	help
+	  By default, the shared TX thread waits indefinitely for a free CAN controller TX
+	  mailbox. If a channel cannot transmit (e.g. no ACK on the CAN bus), this blocks TX on
+	  all channels.
+
+	  When enabled, the TX thread waits at most USBD_GS_USB_TX_TIMEOUT_MS for a free TX
+	  mailbox and then drops the frame. A CAN_ERR_TX_TIMEOUT error frame is sent to the host
+	  for each dropped frame. No echo frame is sent for a dropped frame, so the host does not
+	  see it as transmitted. As a consequence, the host TX contexts of dropped frames stay in
+	  use: once all of them are used, the host reports ENOBUFS for this channel only, and the
+	  channel needs to be brought down and up again on the host after the bus problem has
+	  been resolved. Other channels are not affected.
+
+config USBD_GS_USB_TX_DROP_ECHO
+	bool "Echo dropped frames to the host"
+	depends on USBD_GS_USB_TX_NONBLOCKING
+	help
+	  Also send the echo frame for a dropped frame. This releases the host TX context, so
+	  the channel recovers by itself once the bus problem has been resolved. Note that the
+	  host driver counts the echo frame as a successfully transmitted frame.
+
+config USBD_GS_USB_TX_TIMEOUT_MS
+	int "Timeout for enqueuing a CAN frame for TX"
+	depends on USBD_GS_USB_TX_NONBLOCKING
+	default 20
+	range 0 1000
+	help
+	  Maximum time in milliseconds the shared TX thread waits for a free CAN controller TX
+	  mailbox before dropping the frame. This prevents a channel without bus ACKs from
+	  blocking TX on all other channels.
 
 config USBD_GS_USB_IDENTIFICATION
 	bool "Enable support for CAN channel identification"
